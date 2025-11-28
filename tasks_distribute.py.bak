@@ -1,0 +1,605 @@
+# -*- coding: utf-8 -*-
+import json
+import copy
+from typing import Optional, Dict, Any, List, TypedDict
+from pydantic import BaseModel
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+import os
+import asyncio
+import uuid
+import requests
+import aiohttp
+import logging
+from fastapi.middleware.cors import CORSMiddleware
+from ragflow_sdk import RAGFlow
+
+# 设置日志记录
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 服务器地址配置
+CTC_URL = "http://10.103.238.156:9451/ctc_server"  # 题目匹配服务
+DISCUSSION_URL = "http://10.103.238.156:9452/discussion"  # 问答服务
+LLM_URL = "http://10.103.238.156:9453/chat"  # 大模型服务
+OCR_URL = "http://10.103.238.156:9454/ocr_inference"  # OCR 服务
+H5_URL = "http://10.103.238.156:9457/H5_server"  # H5服务
+HardWare_URL = "http://10.103.238.156:9458/HardWare_server"  # 硬件实验服务
+HardWareGetArgs_URL = "http://10.103.238.156:9455/GetArgs"  # 自然语言转硬件实验设置参数
+COURSE_EXPERIMENT_URL = "http://10.103.238.156:8000/find_experiments"  # 1.py提供的课程实验查询服务
+
+# SDK集成: RagFlow SDK 配置
+RAGFLOW_SDK_BASE_URL = "http://10.103.238.156:8005"
+RAGFLOW_API_KEY = "ragflow-I1ZTM2N2I2MjM2ZjExZjBhODRiZGEyOD"
+RAGFLOW_TARGET_DATASET_NAME = "通原"
+
+target_dataset_ids_for_ragflow: List[str] = []
+ragflow_client: Optional[RAGFlow] = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    global ragflow_client, target_dataset_ids_for_ragflow
+    logging.info("Application startup: Initializing RAGFlow client...")
+    if not RAGFLOW_API_KEY or RAGFLOW_API_KEY == "YOUR_RAGFLOW_API_KEY_HERE":
+        logging.error("RAGFlow API Key 未有效配置，SDK客户端初始化跳过。")
+        return
+
+    try:
+        ragflow_client = RAGFlow(api_key=RAGFLOW_API_KEY, base_url=RAGFLOW_SDK_BASE_URL)
+        logging.info(f"RAGFlow SDK客户端实例已创建，连接到: {RAGFLOW_SDK_BASE_URL}")
+
+        logging.info(f"尝试获取数据集 '{RAGFLOW_TARGET_DATASET_NAME}' 的ID...")
+        datasets_found = await asyncio.to_thread(
+            ragflow_client.list_datasets,
+            name=RAGFLOW_TARGET_DATASET_NAME
+        )
+
+        if datasets_found and hasattr(datasets_found[0], 'id'):
+            target_dataset_ids_for_ragflow = [str(datasets_found[0].id)]
+            logging.info(f"成功获取到数据集 '{RAGFLOW_TARGET_DATASET_NAME}' 的ID: {target_dataset_ids_for_ragflow}")
+        else:
+            logging.error(f"未能找到名为 '{RAGFLOW_TARGET_DATASET_NAME}' 的数据集或返回对象结构不符合预期。")
+            target_dataset_ids_for_ragflow = []
+
+    except Exception as e:
+        logging.error(f"初始化RAGFlow SDK客户端或获取数据集ID时发生错误: {e}", exc_info=True)
+        ragflow_client = None
+        target_dataset_ids_for_ragflow = []
+
+
+templates = Jinja2Templates(directory="templates")
+
+# 临时文件保存目录
+TEMP_FILE_DIR = "temp_files"
+os.makedirs(TEMP_FILE_DIR, exist_ok=True)
+
+
+# 数据模型定义
+class ReplyConfig(TypedDict): info_dict: dict
+
+
+class HistoryConfig(TypedDict): event_type: str; data: dict
+
+
+class IssueConfig(TypedDict): content: str; model: str
+
+
+class Entrance(TypedDict): mode: str
+
+
+class Locale(TypedDict): language: str
+
+
+class Params(TypedDict): config: IssueConfig; history: List; entrance: Entrance; locale: Locale
+
+
+class Attachment(BaseModel): id: str; type: str
+
+
+class ChatMessage(BaseModel): chat_id: int; content: str; attachments: List[Attachment] = []
+
+
+class ChatMessage_H5(BaseModel): chat_id: int; content: str; H5_List: List; attachments: List[Attachment] = []
+
+
+class BotChat(BaseModel): role: str; content: str; attachments: List[Attachment] = []
+
+
+class ChatRequest(BaseModel): openid: str; chat_id: int; message: List[BotChat]
+
+
+# 业务类型和结果字典模板
+business_types_template = {
+    '问题内容': '', '通信原理题目库': 0, '通信原理课堂教师答疑记录': 0,
+    '大模型概念回答': 0, '通信原理课堂交互式案例': 0, '通信原理课堂在线硬件实验': 0,
+    '其他课程实验案例': 0  # 新增：其他课程实验案例业务类型
+}
+results_dict_template = {
+    "大模型概念回答": {"content": "", "list": []},
+    "通信原理题目库": {"content": "", "list": []},
+    "通信原理课堂教师答疑记录": {"content": "", "list": []},
+    "通信原理课堂交互式案例": {"content": "", "list": []},
+    "通信原理课堂在线硬件实验": {"content": "", "list": [], "HardWareArgs": {}},
+    "其他课程实验案例": {"content": "", "list": []},  # 新增：其他课程实验案例结果
+    "下一步可能相关的问题": {"questions_dict": "", "list": []}
+}
+
+
+# 显示前端页面
+@app.get("/", response_class=HTMLResponse)
+async def get_frontend_page(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+# 保存上传的图片文件到本地
+async def save_image_locally(image_file: UploadFile) -> str:
+    try:
+        file_ext = image_file.filename.split('.')[-1]
+        unique_filename = str(uuid.uuid4()) + "." + file_ext
+        temp_file_path = os.path.join(TEMP_FILE_DIR, unique_filename)
+        with open(temp_file_path, "wb") as buffer:
+            content = await image_file.read()
+            buffer.write(content)
+        logging.info(f"图片已保存到临时文件: {temp_file_path}")
+        return temp_file_path
+    except Exception as e:
+        logging.error(f"保存图片时发生错误: {e}")
+        raise HTTPException(status_code=500, detail=f"保存图片时发生错误: {str(e)}")
+
+
+# OCR识别相关函数
+async def get_ocr_text_async_wrapper(file_path: str) -> str:
+    return await asyncio.to_thread(get_ocr_text_sync, file_path)
+
+
+def get_ocr_text_sync(file_path: str) -> str:
+    try:
+        with open(file_path, 'rb') as file:
+            response = requests.post(OCR_URL, files={"file": file})
+        response.raise_for_status()
+        ocr_result = response.json()
+        logging.info(f"OCR完成 ,返回结果: {ocr_result}")
+        return ocr_result["result"]
+    except Exception as e:
+        logging.error(f"OCR处理发生错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"OCR处理发生错误: {str(e)}")
+
+
+# 新增：其他课程实验案例处理任务（调用1.py服务）
+async def Task_other_course_experiments(question: str, model_type: str, current_results_dict_ref: dict):
+    """处理其他课程的实验案例查询，通过调用1.py的API实现"""
+    payload = {
+        "question": question,
+        "model_type": model_type
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(COURSE_EXPERIMENT_URL, json=payload) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logging.error(f"调用课程实验查询服务失败，状态码: {response.status}, 响应: {error_text}")
+                    current_results_dict_ref["其他课程实验案例"]["content"] = "查询实验案例时服务调用失败"
+                    return
+
+                result = await response.json()
+                logging.info(f"课程实验查询服务返回结果: {result}")
+
+                course_name = result.get("course_name", "")
+                if course_name == "通信原理":
+                    current_results_dict_ref["其他课程实验案例"]["content"] = "该问题属于通信原理课程，相关实验请参考通信原理实验内容"
+                    return
+
+                if not result.get("success", False):
+                    current_results_dict_ref["其他课程实验案例"]["content"] = result.get("message", "未找到相关实验案例")
+                    return
+
+                experiments = result.get("experiments", [])
+                if not experiments:
+                    current_results_dict_ref["其他课程实验案例"]["content"] = f"在'{course_name}'课程中未找到相关实验案例"
+                    return
+
+                # 整理结果 - 确保数据结构正确
+                content = f"根据您的提问，在'{course_name}'课程中为您找到以下实验案例：\n"
+                for i, exp in enumerate(experiments, 1):
+                    content += f"{i}. {exp.get('key_word', '')}\n"
+
+                current_results_dict_ref["其他课程实验案例"]["content"] = content
+                current_results_dict_ref["其他课程实验案例"]["list"] = [
+                    {
+                        "实验案例": exp.get("key_word", ""),
+                        "链接": exp.get("url", "")
+                    } for exp in experiments
+                ]
+
+    except Exception as e:
+        logging.error(f"调用课程实验查询服务时发生异常: {str(e)}", exc_info=True)
+        current_results_dict_ref["其他课程实验案例"]["content"] = "查询实验案例时发生异常"
+
+
+# 意图识别函数
+async def auto_select_business_type_async_wrapper(question: str, model_type: str) -> dict:
+    return await asyncio.to_thread(auto_select_business_type_sync, question, model_type)
+
+
+def auto_select_business_type_sync(question: str, model_type: str) -> dict:
+    prompt = (
+        f"{question}\n根据上述的问题选择最合适的业务类型，并按格式返回对应的数字：\n返回内容有且只有如下格式内容，不要添加任何多余文字、字符：\n"
+        "{'问题内容':'xxx','通信原理题目库': 1, '通信原理课堂教师答疑记录': 1, '大模型概念回答': 1,'通信原理课堂交互式案例': 1,'通信原理课堂在线硬件实验': 1,'其他课程实验案例': 1}\n"
+        "我们有多个可用的业务类型：\n1. 通信原理题目库（里面有大量的通信原理相关习题）\n2. 通信原理课堂教师答疑记录\n3. 大模型概念回答（用于概要介绍通信原理相关概念的大模型）\n"
+        "4. 通信原理课堂交互式案例(可以在线进行相关的软件仿真实验)\n5. 通信原理课堂在线硬件实验(可以在线进行相关的硬件仿真实验)\n"
+        "6. 其他课程实验案例(非通信原理的其他课程，如电子技术基础、数字电路等的相关实验案例，只要问题不属于通信原理，均优先标记此类)\n"  # 新增明确引导
+        "请分析问题，并根据问题的内容判断哪些业务类型相关。\n对于每个业务类型，如果问题相关，请返回 1；如果不相关，请返回 0。\n请以字符串的格式返回，字典中每个业务类型的值为 1 或 0，表示该业务类型是否与问题相关。\n"
+    )
+    fallback_response = {'问题内容': question, '通信原理题目库': 1, '通信原理课堂教师答疑记录': 0,
+                         '大模型概念回答': 0, '通信原理课堂交互式案例': 0, '通信原理课堂在线硬件实验': 0,
+                         '其他课程实验案例': 0}
+    payload_intent = {"message": prompt, "model": model_type}
+    logging.info(f"--- auto_select_business_type_sync ---")
+    logging.info(f"LLM_URL Request Payload (intent): {json.dumps(payload_intent, ensure_ascii=False, indent=2)}")
+
+    try:
+        response = requests.post(LLM_URL, json=payload_intent)
+        logging.info(f"LLM_URL Response Status (intent): {response.status_code}")
+        if response.status_code == 200:
+            result_json = response.json()
+            try:
+                result_chat_message = ChatMessage(**result_json)
+                str_data = result_chat_message.content.replace("'", '"')
+                logging.info(f"大模型返回结果 (intent): {str_data}")
+                content = json.loads(str_data)
+                if '问题内容' not in content or not content['问题内容']:
+                    content['问题内容'] = question
+                return content
+            except Exception as e:
+                logging.error(f"意图识别大模型响应解析失败: {e}, 原始响应: {result_json}")
+                return fallback_response
+        else:
+            error_text_intent = response.text
+            logging.error(f"大模型请求失败 (intent)，状态码: {response.status_code}, 响应体: {error_text_intent}")
+            return fallback_response
+    except Exception as e:
+        logging.error(f"意图识别请求失败 (intent): {e}", exc_info=True)
+        return fallback_response
+
+
+# 安全处理JSON响应
+async def safe_json_response(response: aiohttp.ClientResponse) -> dict:
+    try:
+        return await response.json()
+    except Exception as e:
+        error_text = await response.text()
+        logging.error(f"JSON解析失败: {str(e)}, 响应内容: {error_text}")
+        return {}
+
+
+# 创建ChatMessage对象
+async def create_chat_message(response: aiohttp.ClientResponse, message_type: type) -> Optional[BaseModel]:
+    json_data = await safe_json_response(response)
+    if not json_data:
+        return None
+    try:
+        return message_type(** json_data)
+    except Exception as e:
+        logging.error(f"创建消息对象失败: {str(e)}, 数据: {json.dumps(json_data)}")
+        return None
+
+
+# 下一步问题预测
+async def next_question_predict(question: str, answer: str, model_type: str) -> dict:
+    prompt = (
+        f"用户提出的问题：{question}\n大模型返回的答案：{answer}\n请根据用户提出的问题和大模型返回的答案来预测下一步用户可能会问的n个问题：\n"
+        "返回内容有且只有如下格式内容，不要添加任何多余文字、字符：\n预测的下一步的问题数量不能超过4个，最多4个，请用非常非常简短的文字来描述问题\n"
+        "{'0':'quesstion_message','1':'quesstion_message','2':'quesstion_message',...,'n-1':'quesstion_message'}\n"
+        "0,1,2,...,n-1,分别对应用户下一步可能提出的n个问题的序号，要替换为整数数字0,1,2,...,n-1\n"
+        "quesstion_message 表示的是你预测的下一步用户可能会提出的问题的内容，需要将这一关键字替换为你所预测的下一步用户可能会提出的问题的内容\n请以字符串的格式返回\n"
+    )
+    payload_nq = {"message": prompt, "model": model_type}
+    logging.info(f"--- next_question_predict ---")
+    logging.info(f"LLM_URL Request Payload (next_question): {json.dumps(payload_nq, ensure_ascii=False, indent=2)}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(LLM_URL, json=payload_nq) as response:
+                logging.info(f"LLM_URL Response Status (next_question): {response.status}")
+                if response.status == 200:
+                    result_chat_msg = await create_chat_message(response, ChatMessage)
+                    if result_chat_msg and result_chat_msg.content:
+                        str_data = result_chat_msg.content.replace("'", '"')
+                        logging.info(f"下一步可能相关的问题: {str_data}")
+                        return json.loads(str_data)
+                    else:
+                        logging.error(f"LLM_URL (next_question) 响应解析错误或内容为空。")
+                        return {}
+                else:
+                    error_text_nq = await response.text()
+                    logging.error(
+                        f"LLM_URL (next_question) 请求失败，状态码: {response.status}, 响应体: {error_text_nq}")
+                    return {}
+    except Exception as e:
+        logging.error(f"LLM_URL (next_question) 请求时发生异常: {e}", exc_info=True)
+        return {}
+
+
+# 大模型概念回答任务
+async def Task_concept_answer(
+        current_business_types_ref: dict,
+        message_config_ref: dict,
+        current_results_dict_ref: dict
+):
+    global ragflow_client, target_dataset_ids_for_ragflow
+
+    question_for_llm = current_business_types_ref.get('问题内容', message_config_ref.get('content', '无法获取问题内容'))
+    user_model_choice = message_config_ref.get("model", "GPT")
+    retrieved_chunks_text = ""
+
+    if ragflow_client and target_dataset_ids_for_ragflow:
+        logging.info(f"--- Task_concept_answer (SDK Retrieve) ---")
+        try:
+            retrieved_items: List[Any] = await asyncio.to_thread(
+                ragflow_client.retrieve,
+                question=question_for_llm,
+                dataset_ids=target_dataset_ids_for_ragflow,
+                page_size=3, similarity_threshold=0.3,
+            )
+            if retrieved_items:
+                chunks_builder = ["\n\n以下是知识库中检索到的相关参考信息："]
+                for i, item in enumerate(retrieved_items):
+                    chunk_content = ""
+                    if hasattr(item, 'content'):
+                        chunk_content = item.content
+                    elif isinstance(item, dict):
+                        chunk_content = item.get('content', '')
+                    else:
+                        logging.warning(f"SDK检索到的item类型未知: {type(item)}")
+                    if chunk_content:
+                        chunks_builder.append(f"参考片段 {i + 1}: {chunk_content}")
+                retrieved_chunks_text = "\n".join(chunks_builder)
+                logging.info(f"SDK Retrieve Call SUCCESS, {len(retrieved_items)} items retrieved.")
+            else:
+                logging.info("SDK Retrieve Call: 未找到相关chunks。")
+        except Exception as e:
+            logging.error(f"SDK Retrieve Call FAILED: {e}", exc_info=True)
+            retrieved_chunks_text = "\n\n(知识库检索异常)\n"
+    elif not ragflow_client:
+        logging.warning("SDK客户端未初始化，跳过知识库检索。")
+    else:
+        logging.warning("SDK目标Dataset IDs未获取成功，跳过知识库检索。")
+
+    if retrieved_chunks_text:
+        prompt_for_llm = (f"请结合以下知识库信息（如果与问题相关）以及你已有的知识，用较少的文字在通信领域内回答问题。\n"
+                          f"{retrieved_chunks_text}\n\n用户的问题是：{question_for_llm}")
+    else:
+        prompt_for_llm = (f"用较少的文字来回答下面问题中，回答范围限定在通信领域, "
+                          f"问题：{question_for_llm}")
+
+    payload_concept = {"message": prompt_for_llm, "model": user_model_choice}
+    logging.info(f"--- Task_concept_answer (LLM_URL call) ---")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(LLM_URL, json=payload_concept) as response:
+                logging.info(f"LLM_URL Response Status (concept): {response.status}")
+                if response.status == 200:
+                    result_chat_msg = await create_chat_message(response, ChatMessage)
+                    if result_chat_msg and result_chat_msg.content:
+                        logging.info(
+                            f"LLM_URL (concept) 响应成功。上下文: {'RagFlow SDK' if retrieved_chunks_text else '无'}")
+                        current_results_dict_ref["大模型概念回答"]["content"] = result_chat_msg.content
+                    else:
+                        logging.error(f"LLM_URL (concept) 响应解析错误或内容为空。")
+                        current_results_dict_ref["大模型概念回答"]["content"] = "大模型概念回答获取失败（响应解析问题）。\n"
+                else:
+                    error_text_concept = await response.text()
+                    logging.error(f"LLM_URL (concept) 请求失败，状态码: {response.status}, 响应体: {error_text_concept}")
+                    current_results_dict_ref["大模型概念回答"]["content"] = "大模型概念回答请求失败\n"
+    except Exception as e:
+        logging.error(f"LLM_URL (concept) 请求时发生异常: {e}", exc_info=True)
+        current_results_dict_ref["大模型概念回答"]["content"] = "大模型概念回答请求时发生异常\n"
+
+
+# 其他业务任务函数
+async def Task_search_question_bank(current_business_types_ref: dict, current_results_dict_ref: dict):
+    def sync_call():
+        response = requests.post(CTC_URL, json={"message": current_business_types_ref["问题内容"]})
+        if response.status_code == 200:
+            result = response.json();
+            result = ChatMessage(**result)
+            logging.info(f"通信原理题库完成响应")
+            current_results_dict_ref["通信原理题目库"]["content"] = result.content
+        else:
+            logging.error(f"通信原理题库请求失败，状态码: {response.status_code}")
+            current_results_dict_ref["通信原理题目库"]["content"] = "通信原理请求失败\n"
+
+    await asyncio.to_thread(sync_call)
+
+
+async def Task_search_QA_record(current_business_types_ref: dict, current_results_dict_ref: dict):
+    def sync_call():
+        response = requests.post(DISCUSSION_URL, json={"message": current_business_types_ref["问题内容"]})
+        if response.status_code == 200:
+            result = response.json();
+            result = ChatMessage(** result)
+            logging.info(f"教师问答记录完成响应")
+            current_results_dict_ref["通信原理课堂教师答疑记录"]["content"] = result.content
+        else:
+            logging.error(f"教师问答记录请求失败，状态码: {response.status_code}")
+            current_results_dict_ref["通信原理课堂教师答疑记录"]["content"] = "教师问答记录请求失败\n"
+
+    await asyncio.to_thread(sync_call)
+
+
+async def Task_interactive_stories(current_business_types_ref: dict, current_results_dict_ref: dict):
+    def sync_call():
+        response = requests.post(H5_URL, json={"message": current_business_types_ref["问题内容"]})
+        if response.status_code == 200:
+            result = response.json();
+            result = ChatMessage_H5(**result)
+            logging.info(f"通信原理课堂交互式案例完成响应")
+            current_results_dict_ref["通信原理课堂交互式案例"]["content"] = result.content
+            current_results_dict_ref["通信原理课堂交互式案例"]["list"] = result.H5_List
+        else:
+            logging.error(f"通信原理课堂交互式案例请求失败，状态码: {response.status_code}")
+            current_results_dict_ref["通信原理课堂交互式案例"]["content"] = "通信原理课堂交互式案请求失败\n"
+
+    await asyncio.to_thread(sync_call)
+
+
+async def Task_experiments(current_business_types_ref: dict, current_results_dict_ref: dict):
+    def sync_call():
+        try:
+            response = requests.post(HardWare_URL, json={"message": current_business_types_ref["问题内容"]})
+            args_response = requests.post(HardWareGetArgs_URL, json={"message": current_business_types_ref["问题内容"]})
+            if response.status_code == 200 and args_response.status_code == 200:
+                result = response.json();
+                args_dict = args_response.json();
+                result = ChatMessage_H5(** result)
+                logging.info(f"通信原理课堂在线硬件实验完成响应")
+                current_results_dict_ref["通信原理课堂在线硬件实验"]["content"] = result.content
+                current_results_dict_ref["通信原理课堂在线硬件实验"]["list"] = result.H5_List
+                current_results_dict_ref["通信原理课堂在线硬件实验"]["HardWareArgs"] = args_dict.get("HardWareArgs", {})
+            else:
+                logging.error(
+                    f"通信原理课堂在线硬件实验请求失败，状态码: 网址请求：{response.status_code},参数请求：{args_response.status_code}")
+                current_results_dict_ref["通信原理课堂在线硬件实验"]["content"] = "通信原理课堂在线硬件实验请求失败\n"
+        except Exception as e:
+            logging.error(f"硬件实验任务中请求发生异常: {str(e)}", exc_info=True)
+            current_results_dict_ref["通信原理课堂在线硬件实验"]["content"] = f"通信原理课堂在线硬件实验请求发生异常\n"
+
+    await asyncio.to_thread(sync_call)
+
+
+async def Task_next_question_predict_wrapper(
+        current_business_types_ref: dict,
+        message_config_ref: dict,
+        current_results_dict_ref: dict
+):
+    llm_answer_content = current_results_dict_ref["大模型概念回答"].get("content", "")
+    if not llm_answer_content or llm_answer_content.startswith(
+            "大模型概念回答获取失败") or llm_answer_content.startswith("大模型概念回答请求失败"):
+        logging.warning(f"无法基于当前概念回答进行下一步问题预测。")
+        current_results_dict_ref["下一步可能相关的问题"]["questions_dict"] = {}
+        return
+
+    predicted_questions_data = await next_question_predict(
+        question=current_business_types_ref.get('问题内容', message_config_ref.get('content', '未知问题')),
+        answer=llm_answer_content,
+        model_type=message_config_ref.get('model', 'GPT')
+    )
+    current_results_dict_ref["下一步可能相关的问题"]["questions_dict"] = predicted_questions_data
+
+
+@app.post("/tasks_distribute")
+async def tasks_distribute(
+        config: str = Form(...), entrance: str = Form(...), locale: str = Form(...),
+        image: Optional[UploadFile] = File(None),
+):
+    current_business_types = copy.deepcopy(business_types_template)
+    current_results_dict = copy.deepcopy(results_dict_template)
+
+    try:
+        message_from_form_str = config
+        str_data = message_from_form_str.replace("'", '"')
+        message_config = json.loads(str_data)
+        if not message_config or not isinstance(message_config, dict) or "content" not in message_config:
+            raise HTTPException(status_code=400, detail="未提供消息或消息格式不正确")
+
+        ocr_text = None
+        if image is not None:
+            temp_file_path = await save_image_locally(image)
+            ocr_text = await get_ocr_text_async_wrapper(temp_file_path)
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+                logging.info(f"已删除临时文件: {temp_file_path}")
+
+        user_original_question = message_config['content']
+        combined_question_for_intent = user_original_question
+        if ocr_text:
+            combined_question_for_intent = (
+                f"用户的文字提问: 在通信领域里：{user_original_question}\n用户的图片提问里的文字: {ocr_text}\n请结合上述两个信息，生成一个连贯的问题。"
+                f"请不要仅仅将用户的文字提问和用户的图片提问里的文字拼接在一起，而是要进行合适的逻辑处理，生成一个合理且自然的问题，该合成的问题用于下面的业务选择，并存入返回字典的问题内容里。")
+
+        logging.info(f"待融合的问题 (用于意图识别): {combined_question_for_intent}")
+        try:
+            identified_business_config = await auto_select_business_type_async_wrapper(
+                combined_question_for_intent, model_type=message_config.get('model', 'GPT')
+            )
+            current_business_types.update(identified_business_config)
+            if '问题内容' not in current_business_types or not current_business_types['问题内容']:
+                current_business_types['问题内容'] = combined_question_for_intent
+                logging.warning(f"意图识别结果未包含有效'问题内容'，已回退使用: {combined_question_for_intent}")
+        except Exception as e:
+            logging.error(f"意图识别步骤中发生错误: {e}", exc_info=True)
+            current_business_types = business_types_template.copy()
+            current_business_types['问题内容'] = combined_question_for_intent
+            current_business_types['通信原理题目库'] = 1
+            current_business_types['大模型概念回答'] = 1
+
+        current_business_types["大模型概念回答"] = 1  # 强制回答
+        logging.info(f"最终确定的业务类型: {current_business_types}")
+        logging.info(f"用于各项业务的问题内容: {current_business_types.get('问题内容', '未能获取问题内容')}")
+
+        tasks_to_run = []
+        other_businesses_all_zero = all(
+            current_business_types.get(key, 0) == 0 for key in [
+                "通信原理题目库", "通信原理课堂教师答疑记录",
+                "通信原理课堂交互式案例", "通信原理课堂在线硬件实验",
+                "其他课程实验案例"  # 新增
+            ]
+        )
+
+        if other_businesses_all_zero:
+            logging.info("除大模型概念回答外，其他业务均未激活。仅执行大模型概念回答。")
+            tasks_to_run.append(Task_concept_answer(current_business_types, message_config, current_results_dict))
+        else:
+            logging.info(f"业务问题内容: {current_business_types['问题内容']}")
+            if current_business_types.get("大模型概念回答", 0) == 1:
+                tasks_to_run.append(Task_concept_answer(current_business_types, message_config, current_results_dict))
+            if current_business_types.get("通信原理题目库", 0) == 1:
+                tasks_to_run.append(Task_search_question_bank(current_business_types, current_results_dict))
+            if current_business_types.get("通信原理课堂教师答疑记录", 0) == 1:
+                tasks_to_run.append(Task_search_QA_record(current_business_types, current_results_dict))
+            if current_business_types.get("通信原理课堂交互式案例", 0) == 1:
+                tasks_to_run.append(Task_interactive_stories(current_business_types, current_results_dict))
+            if current_business_types.get("通信原理课堂在线硬件实验", 0) == 1:
+                tasks_to_run.append(Task_experiments(current_business_types, current_results_dict))
+            # 新增：其他课程实验案例任务
+            if current_business_types.get("其他课程实验案例", 0) == 1:
+                tasks_to_run.append(Task_other_course_experiments(
+                    current_business_types.get("问题内容", ""),
+                    message_config.get('model','GPT'),
+                    current_results_dict
+                ))
+
+        if tasks_to_run:
+            await asyncio.gather(*tasks_to_run)
+
+        # 下一步问题预测
+        await Task_next_question_predict_wrapper(current_business_types, message_config, current_results_dict)
+
+        response_data: ReplyConfig = {"info_dict": current_results_dict}
+        return response_data
+
+    except json.JSONDecodeError as e:
+        logging.error(f"请求参数 'config' 解析失败: {e}")
+        raise HTTPException(status_code=400, detail=f"请求参数 'config' JSON解析错误: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"tasks_distribute 中发生错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"服务器内部发生错误: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=9450)
