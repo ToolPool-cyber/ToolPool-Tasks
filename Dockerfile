@@ -1,25 +1,31 @@
-COPY tasks_distribute.py /app/tasks_distribute.pyFROM python:3.10 as builder
+# 第一阶段：构建环境（安装依赖）
+FROM python:3.10 as builder
 
 WORKDIR /app
-#RUN pip install --upgrade pip
-#安装需要的库
-COPY ./requirements.txt /app/
-RUN pip install --upgrade pip && \
-        pip install -r requirements.txt -i https://pypi.org/simple
-#RUN apt-get update
-#RUN apt-get install ffmpeg libsm6 libxext6  -y
+
+# 设置 pip 源（选用阿里云镜像加速，可选）
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+
+# 复制依赖清单
+COPY requirements.txt .
+
+# 安装依赖到指定目录
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
-# 两阶段构建 利用缓存
+# 第二阶段：运行环境（最终镜像）
 FROM python:3.10
-WORKDIR /app
-#RUN apt-get update
-#RUN apt-get install ffmpeg libsm6 libxext6  -y
-COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 
-# 将当前项目目录下的所有文件添加到容器的 /app 目录
+WORKDIR /app
+
+# 从第一阶段复制安装好的依赖库（这样镜像更小）
+COPY --from=builder /install /usr/local
+
+# 复制你的核心代码
 COPY tasks_distribute.py /app/tasks_distribute.py
 
+# 暴露端口
 EXPOSE 9450
-#CMD ["python","input.py"]
-CMD ["python","tasks_distribute.py"]
+
+# 启动命令
+CMD ["python", "tasks_distribute.py"]
