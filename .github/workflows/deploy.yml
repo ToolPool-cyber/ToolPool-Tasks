@@ -1,0 +1,38 @@
+name: Tasks Manual Deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Deploy with Docker
+        run: |
+          echo "🚀 开始部署 Tasks Distribute 服务..."
+
+          # --- ⚙️ 配置区域 ---
+          IMAGE_NAME="tasks-distribute-image"
+          CONTAINER_NAME="tasks_123"
+          PORT_MAPPING="9450:9450"
+          # ------------------
+
+          echo "1. 构建新镜像..."
+          docker build -t $IMAGE_NAME:latest .
+
+          echo "2. 清理旧容器..."
+          docker stop $CONTAINER_NAME || true
+          docker rm $CONTAINER_NAME || true
+
+          echo "3. 启动新容器..."
+          docker run -d \
+            --name $CONTAINER_NAME \
+            --restart always \
+            -p $PORT_MAPPING \
+            $IMAGE_NAME:latest
+
+          echo "✅ 部署完成！"
